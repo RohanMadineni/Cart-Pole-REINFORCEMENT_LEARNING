@@ -1,0 +1,443 @@
+class CartPoleOptimalControlEnv(gym.Env):
+    """Custom Gym environment for cart-pole system with optimal control."""
+
+    def __init__(self):
+        """
+        Initialize the environment parameters and action space.
+        """
+        self.M = 40.0  # Mass of the cart (kg)
+        self.mp = 2.0  # Mass of the pole (kg)
+        self.L = 0.75  # Length of the pole (m)
+        self.g = 10  # Acceleration due to gravity (m/s^2)
+
+        # State space: [cart position (x), cart velocity (x_dot), pole angle (theta), pole angular velocity (theta_dot)]
+        POSITIVE_INF = float('inf')  # Define a constant for positive infinity
+        NEGATIVE_INF = -float('inf')  # Define a constant for negative infinity
+        self.state_space = Box(low=np.array([-2.4, NEGATIVE_INF, -np.pi/2, NEGATIVE_INF]),
+                                high=np.array([2.4, POSITIVE_INF, np.pi/2, POSITIVE_INF]))
+
+        # Action space: Force applied to the cart (Fx)
+        self.action_space = Box(low=-5.0, high=5.0)  # Force limits in Newtons
+
+        self.threshold = 195
+
+        # Initial state
+        self.reset()
+
+        # Time step (seconds)
+        self.dt = 0.02
+
+    def step(self, action):
+        """
+        Performs one simulation step of the cart-pole system based on the given action.
+
+        Args:
+            action: Force applied to the cart (Fx)
+
+        Returns:
+            observation (ndarray): The next state of the system.
+            reward (float): The reward for the current step.
+            done (bool): Whether the episode is finished.
+            info (dict): Additional information about the episode.
+        """
+
+        # Check if action is within bounds
+        if action < self.action_space.low[0] or action > self.action_space.high[0]:
+          raise ValueError("Action ({}) out of bounds".format(action))
+
+        # Update time step
+        self.t += self.dt
+
+        # Equations of motion
+        F_x = action
+        tau = (self.M * self.L * self.theta_dot**2 * np.sin(self.theta) + self.M * self.g * self.L * np.cos(self.theta) * np.sin(self.theta)) / \
+              (self.M + self.mp * np.sin(self.theta)**2)
+        x_ddot = (F_x - self.mp * self.L * (self.theta_dot**2) * np.sin(self.theta)+ self.mp * self.g * (np.sin(self.theta)*np.cos(self.theta))) / \
+              (self.M + self.mp * np.sin(self.theta)**2)
+        theta_ddot = ((F_x - self.mp * self.L * (self.theta_dot**2) * np.sin(self.theta)) * np.cos(self.theta) + (self.M + self.mp) * self.g * np.sin(self.theta)) / \
+              (self.M + self.mp * np.sin(self.theta)**2)*self.L
+
+
+
+
+        # Update state using numerical integration
+        self.x_dot += x_ddot * self.dt
+        self.x += self.x_dot * self.dt
+        self.theta_dot += theta_ddot * self.dt
+        self.theta += self.theta_dot * self.dt
+
+        # Terminal conditions
+        done = bool(
+            self.x < self.state_space.low[0] or
+            self.x > self.state_space.high[0] or
+            np.abs(self.theta) > np.pi/2 or
+            self.t >= 5  # Maximum episode length
+        )
+
+        # Reward function: Encourage staying close to the center and upright position
+        reward =  - np.abs(self.theta)*np.abs(self.theta)  - np.abs(self.theta_dot)*np.abs(self.theta_dot)
+        # reward =  - np.abs(self.theta) - np.abs(self.x)
+        # reward = np.cos(self.theta)
+
+
+        # Observation (state)
+        observation = np.array([self.x, self.x_dot, self.theta, self.theta_dot])
+
+        return observation, reward, done, {}
+
+    def reset(self):
+        """
+        Resets the environment to the initial state with some randomness.
+
+        Returns:
+            observation (ndarray): The initial state of the system with random initial angle.
+        """
+        self.x = 0.0
+        self.x_dot = 0.0
+        # Randomize initial angle within a defined range
+        self.theta = np.random.uniform(low=-np.pi/2, high=np.pi/2)  # Adjust range as needed
+        self.theta_dot = 0.0
+        self.t = 0.0
+        return np.array([self.x, self.x_dot, self.theta, self.theta_dot])
+
+
+class ReplayBuffer():
+    def __init__(self, buffer_limit, DEVICE):
+        self.buffer = deque(maxlen=buffer_limit)
+        self.dev = DEVICE
+
+    def put(self, transition):
+        self.buffer.append(transition)
+
+    def sample(self, n):
+        mini_batch = random.sample(self.buffer, n)
+        s_lst, a_lst, r_lst, s_prime_lst, done_mask_lst = [], [], [], [], []
+
+        for transition in mini_batch:
+            s, a, r, s_prime, done = transition
+            s_lst.append(s)
+            a_lst.append(a)
+            r_lst.append([r])
+            s_prime_lst.append(s_prime)
+            done_mask = 0.0 if done else 1.0
+            done_mask_lst.append([done_mask])
+
+        s_batch = torch.tensor(s_lst, dtype=torch.float).to(self.dev)
+        a_batch = torch.tensor(a_lst, dtype=torch.float).to(self.dev)
+        r_batch = torch.tensor(r_lst, dtype=torch.float).to(self.dev)
+        s_prime_batch = torch.tensor(s_prime_lst, dtype=torch.float).to(self.dev)
+        done_batch = torch.tensor(done_mask_lst, dtype=torch.float).to(self.dev)
+
+        # r_batch = (r_batch - r_batch.mean()) / (r_batch.std() + 1e-7)
+
+        return s_batch, a_batch, r_batch, s_prime_batch, done_batch
+
+    def size(self):
+        return len(self.buffer)
+
+
+class PolicyNetwork(nn.Module):
+    def __init__(self, state_dim, action_dim, actor_lr):
+        super(PolicyNetwork, self).__init__()
+
+        self.fc_1 = nn.Linear(state_dim, 128)
+        self.fc_2 = nn.Linear(128,128)
+        self.fc_mu = nn.Linear(128, action_dim)
+        self.fc_std = nn.Linear(128, action_dim)
+
+        self.lr = actor_lr
+
+        self.LOG_STD_MIN = -20
+        self.LOG_STD_MAX = 2
+        self.max_action = 2
+        self.min_action = -2
+        self.action_scale = (self.max_action - self.min_action) / 2.0
+        self.action_bias = (self.max_action + self.min_action) / 2.0
+
+        self.optimizer = optim.Adam(self.parameters(), lr=self.lr)
+
+    def forward(self, x):
+
+        x = F.leaky_relu(self.fc_1(x))
+        x = F.leaky_relu(self.fc_2(x))
+        mu = self.fc_mu(x)
+        log_std = self.fc_std(x)
+        log_std = torch.clamp(log_std, self.LOG_STD_MIN, self.LOG_STD_MAX)
+        return mu, log_std
+
+    def sample(self, state):
+
+        mean, log_std = self.forward(state)
+        std = torch.exp(log_std)
+        reparameter = Normal(mean, std)
+        x_t = reparameter.rsample()
+        y_t = torch.tanh(x_t)
+        action = self.action_scale * y_t + self.action_bias
+
+        # # Enforcing Action Bound
+        log_prob = reparameter.log_prob(x_t)
+        log_prob = log_prob - torch.sum(torch.log(self.action_scale * (1 - y_t.pow(2)) + 1e-6), dim=-1, keepdim=True)
+
+        return action, log_prob
+
+
+class QNetwork(nn.Module):
+    def __init__(self, state_dim, action_dim, critic_lr):
+        super(QNetwork, self).__init__()
+
+        self.fc_s = nn.Linear(state_dim, 64)
+        self.fc_a = nn.Linear(action_dim, 64)
+        self.fc_1 = nn.Linear(128, 128)
+        self.fc_out = nn.Linear(128, action_dim)
+
+        self.lr = critic_lr
+
+        self.optimizer = optim.Adam(self.parameters(), lr=self.lr)
+
+    def forward(self, x, a):
+        h1 = F.leaky_relu(self.fc_s(x))
+        h2 = F.leaky_relu(self.fc_a(a))
+        cat = torch.cat([h1, h2], dim=-1)
+        q = F.leaky_relu(self.fc_1(cat))
+        q = self.fc_out(q)
+        return q
+
+
+class SAC_Agent:
+    def __init__(self):
+        self.state_dim      = 4  # [cos(theta), sin(theta), theta_dot]
+        self.action_dim     = 1  # [Force] in[-2,2]
+        self.lr_pi          = 0.01
+        self.lr_q           = 0.01
+        self.gamma          = 0.999
+        self.batch_size     = 200
+        self.buffer_limit   = 10000
+        self.tau            = 0.005
+        self.init_alpha     = 0.01
+        self.target_entropy = -self.action_dim  # == -1
+        self.lr_alpha       = 0.005
+        self.DEVICE         = torch.device("cuda" if torch.cuda.is_available() else "cpu")
+        self.memory         = ReplayBuffer(self.buffer_limit, self.DEVICE)
+
+        self.log_alpha = torch.tensor(np.log(self.init_alpha)).to(self.DEVICE)
+        self.log_alpha.requires_grad = True
+        self.log_alpha_optimizer = optim.Adam([self.log_alpha], lr=self.lr_alpha)
+
+        self.PI  = PolicyNetwork(self.state_dim, self.action_dim, self.lr_pi).to(self.DEVICE)
+        self.Q1        = QNetwork(self.state_dim, self.action_dim, self.lr_q).to(self.DEVICE)
+        self.Q1_target = QNetwork(self.state_dim, self.action_dim, self.lr_q).to(self.DEVICE)
+        self.Q2        = QNetwork(self.state_dim, self.action_dim, self.lr_q).to(self.DEVICE)
+        self.Q2_target = QNetwork(self.state_dim, self.action_dim, self.lr_q).to(self.DEVICE)
+
+        self.Q1_target.load_state_dict(self.Q1.state_dict())
+        self.Q2_target.load_state_dict(self.Q2.state_dict())
+
+    def choose_action(self, s):
+        with torch.no_grad():
+            action, log_prob = self.PI.sample(s.to(self.DEVICE))
+        return action, log_prob
+
+    def calc_target(self, mini_batch):
+        s, a, r, s_prime, done = mini_batch
+        with torch.no_grad():
+            a_prime, log_prob_prime = self.PI.sample(s_prime)
+            entropy = - self.log_alpha.exp() * log_prob_prime
+            q1_target, q2_target = self.Q1_target(s_prime, a_prime), self.Q2_target(s_prime, a_prime)
+            q_target = torch.min(q1_target, q2_target)
+            target = r + self.gamma * done * (q_target + entropy)
+        return target
+
+    def train_agent(self):
+        mini_batch = self.memory.sample(self.batch_size)
+        s_batch, a_batch, r_batch, s_prime_batch, done_batch = mini_batch
+
+        td_target = self.calc_target(mini_batch)
+
+        #### Q1 train ####
+        q1_loss = F.smooth_l1_loss(self.Q1(s_batch, a_batch), td_target)
+        self.Q1.optimizer.zero_grad()
+        q1_loss.mean().backward()
+        self.Q1.optimizer.step()
+        #### Q1 train ####
+
+        #### Q2 train ####
+        q2_loss = F.smooth_l1_loss(self.Q2(s_batch, a_batch), td_target)
+        self.Q2.optimizer.zero_grad()
+        q2_loss.mean().backward()
+        self.Q2.optimizer.step()
+        #### Q2 train ####
+
+        #### pi train ####
+        a, log_prob = self.PI.sample(s_batch)
+        entropy = -self.log_alpha.exp() * log_prob
+
+        q1, q2 = self.Q1(s_batch, a), self.Q2(s_batch, a)
+        q = torch.min(q1, q2)
+
+        pi_loss = -(q + entropy)
+        self.PI.optimizer.zero_grad()
+        pi_loss.mean().backward()
+        self.PI.optimizer.step()
+        #### pi train ####
+
+        #### alpha train ####
+        self.log_alpha_optimizer.zero_grad()
+        alpha_loss = -(self.log_alpha.exp() * (log_prob + self.target_entropy).detach()).mean()
+        alpha_loss.backward()
+        self.log_alpha_optimizer.step()
+        #### alpha train ####
+
+        #### Q1, Q2 soft-update ####
+        for param_target, param in zip(self.Q1_target.parameters(), self.Q1.parameters()):
+            param_target.data.copy_(param_target.data * (1.0 - self.tau) + param.data * self.tau)
+        for param_target, param in zip(self.Q2_target.parameters(), self.Q2.parameters()):
+            param_target.data.copy_(param_target.data * (1.0 - self.tau) + param.data * self.tau)
+        #### Q1, Q2 soft-update ####
+
+agent = SAC_Agent()
+env = CartPoleOptimalControlEnv()
+
+EPISODE = 100
+print_once = True
+score_list = []
+
+for EP in range(EPISODE):
+    state = env.reset()
+    # state = state[0]
+    # state[0] = -1
+    # state[1] = 0
+    # print(state)
+    score, done = 0.0, False
+    itr = 2000
+    count = 0
+    while not done and itr >=0:
+        itr -= 1
+        action, log_prob = agent.choose_action(torch.FloatTensor(state))
+        action = action.detach().cpu().numpy()
+        state_prime, reward, done,*_ = env.step(action)
+        state_prime = state_prime.ravel()
+        reward = reward[0]
+        # print(done)
+        # print(action, log_prob)
+        # print(state_prime, reward)
+        agent.memory.put((state, action, reward, state_prime, done))
+        score += reward
+
+        state = state_prime
+
+        if agent.memory.size() > 1000:
+            agent.train_agent()
+        # count += 1
+
+    print("EP:{}, Avg_Score:{:.1f}".format(EP+1, score))
+    score_list.append(score)
+import torch
+import numpy as np
+import matplotlib.pyplot as plt
+
+def evaluate_ppo(env, policy_model,angle):
+  rewards = []
+  control_inputs = []
+  states = []
+  for _ in range(1):
+    state = env.reset()
+    print(state)
+    state[2]=angle
+    episode_rewards = []
+    episode_control_inputs = []
+    episode_states = []
+    done = False
+    while not done:
+
+      action, log_prob = agent.choose_action(torch.FloatTensor(state))
+      action = action.detach().cpu().numpy()
+      next_state, reward, done, info = env.step(action)
+      next_state = next_state.ravel()
+      episode_rewards.append(reward)
+      episode_control_inputs.append(action)
+      episode_states.append(state)
+      state = next_state
+
+    rewards.append(sum(episode_rewards))
+    control_inputs.append(np.array(episode_control_inputs))
+    states.append(np.array(episode_states))
+  return rewards, control_inputs, states
+
+
+
+
+rewards, control_inputs, states = evaluate_ppo(env, agent,1.0472)
+
+# Assuming 'episode_idx' is the index of the chosen episode
+episode_ctrl_inputs = control_inputs[0]
+episode_states = states[0]
+plt.figure(figsize=(12, 6))
+
+# Control input plot
+plt.subplot(211)
+# for dim in range(len(episode_ctrl_inputs)):  # Assuming multiple dimensions
+plt.plot(episode_ctrl_inputs, label=f'Control Input {1}')
+plt.xlabel('Timestep')
+plt.ylabel('Control Input Value')
+plt.legend()
+
+# State plot (assuming multiple dimensions)
+plt.subplot(212)
+# for dim in range(len(episode_states[0])):
+plt.plot(episode_states[:,2], label=f'State {1}')
+plt.xlabel('Timestep')
+plt.ylabel('State Value')
+plt.legend()
+
+plt.tight_layout()
+plt.show()
+rewards, control_inputs, states = evaluate_ppo(env, agent,0.5236)
+# Assuming 'episode_idx' is the index of the chosen episode
+episode_ctrl_inputs = control_inputs[0]
+episode_states = states[0]
+plt.figure(figsize=(12, 6))
+
+# Control input plot
+plt.subplot(211)
+# for dim in range(len(episode_ctrl_inputs)):  # Assuming multiple dimensions
+plt.plot(episode_ctrl_inputs, label=f'Control Input {1}')
+plt.xlabel('Timestep')
+plt.ylabel('Control Input Value')
+plt.legend()
+
+# State plot (assuming multiple dimensions)
+plt.subplot(212)
+# for dim in range(len(episode_states[0])):
+plt.plot(episode_states[:,2], label=f'State {1}')
+plt.xlabel('Timestep')
+plt.ylabel('State Value')
+plt.legend()
+
+plt.tight_layout()
+plt.show()
+rewards, control_inputs, states = evaluate_ppo(env, agent,1.5708)
+# Assuming 'episode_idx' is the index of the chosen episode
+episode_ctrl_inputs = control_inputs[0]
+episode_states = states[0]
+plt.figure(figsize=(12, 6))
+# print(states[0])
+# print(episode_states[:,0])
+# Control input plot
+plt.subplot(211)
+# for dim in range(len(episode_ctrl_inputs)):  # Assuming multiple dimensions
+plt.plot(episode_ctrl_inputs, label=f'Control Input {1}')
+plt.xlabel('Timestep')
+plt.ylabel('Control Input Value')
+plt.legend()
+
+# State plot (assuming multiple dimensions)
+plt.subplot(212)
+# for dim in range(len(episode_states[0])):
+plt.plot(episode_states[:,2], label=f'State {1}')
+plt.xlabel('Timestep')
+plt.ylabel('State Value')
+plt.legend()
+
+plt.tight_layout()
+plt.show()
+
