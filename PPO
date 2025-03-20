@@ -1,0 +1,339 @@
+class CartPoleOptimalControlEnv(gym.Env):
+    """Custom Gym environment for cart-pole system with optimal control."""
+
+    def __init__(self):
+        """
+        Initialize the environment parameters and action space.
+        """
+        self.M = 40.0  # Mass of the cart (kg)
+        self.mp = 2.0  # Mass of the pole (kg)
+        self.L = 0.75  # Length of the pole (m)
+        self.g = 10  # Acceleration due to gravity (m/s^2)
+
+        # State space: [cart position (x), cart velocity (x_dot), pole angle (theta), pole angular velocity (theta_dot)]
+        POSITIVE_INF = float('inf')  # Define a constant for positive infinity
+        NEGATIVE_INF = -float('inf')  # Define a constant for negative infinity
+        self.state_space = Box(low=np.array([-100000, NEGATIVE_INF, -np.pi/2, NEGATIVE_INF]),
+                                high=np.array([100000, POSITIVE_INF, np.pi/2, POSITIVE_INF]))
+
+        # Action space: Force applied to the cart (Fx)
+        self.action_space = Box(low=-5.0, high=5.0)  # Force limits in Newtons
+
+        self.threshold = 195
+
+        # Initial state
+        self.reset()
+
+        # Time step (seconds)
+        self.dt = 0.02
+
+    def step(self, action):
+        """
+        Performs one simulation step of the cart-pole system based on the given action.
+
+        Args:
+            action: Force applied to the cart (Fx)
+
+        Returns:
+            observation (ndarray): The next state of the system.
+            reward (float): The reward for the current step.
+            done (bool): Whether the episode is finished.
+            info (dict): Additional information about the episode.
+        """
+
+        # Check if action is within bounds
+        if action < self.action_space.low[0] or action > self.action_space.high[0]:
+          raise ValueError("Action ({}) out of bounds".format(action))
+
+        # Update time step
+        self.t += self.dt
+
+        # Equations of motion
+        F_x = action
+        tau = (self.M * self.L * self.theta_dot**2 * np.sin(self.theta) + self.M * self.g * self.L * np.cos(self.theta) * np.sin(self.theta)) / \
+              (self.M + self.mp * np.sin(self.theta)**2)
+        x_ddot = (F_x - self.mp * self.L * (self.theta_dot**2) * np.sin(self.theta)+ self.mp * self.g * (np.sin(self.theta)*np.cos(self.theta))) / \
+              (self.M + self.mp * np.sin(self.theta)**2)
+        theta_ddot = ((F_x - self.mp * self.L * (self.theta_dot**2) * np.sin(self.theta)) * np.cos(self.theta) + (self.M + self.mp) * self.g * np.sin(self.theta)) / \
+              (self.M + self.mp * np.sin(self.theta)**2)*self.L
+
+
+
+
+        # Update state using numerical integration
+        self.x_dot += x_ddot * self.dt
+        self.x += self.x_dot * self.dt
+        self.theta_dot += theta_ddot * self.dt
+        self.theta += self.theta_dot * self.dt
+
+        # Terminal conditions
+        done = bool(
+            self.x < self.state_space.low[0] or
+            self.x > self.state_space.high[0] or
+            np.abs(self.theta) > np.pi/2 or
+            self.t >= 100000  # Maximum episode length
+        )
+
+        # Reward function: Encourage staying close to the center and upright position
+        # reward =  - np.abs(self.theta) - np.abs(self.x) - np.abs(self.theta_dot) - np.abs(self.x_dot)
+        reward =  - (abs(self.theta)**2)-abs(self.theta_dot)**2
+        # reward = np.cos(self.theta)
+
+
+        # Observation (state)
+        observation = np.array([self.x, self.x_dot, self.theta, self.theta_dot])
+
+        return observation, reward, done, {}
+
+    def reset(self):
+        """
+        Resets the environment to the initial state with some randomness.
+
+        Returns:
+            observation (ndarray): The initial state of the system with random initial angle.
+        """
+        self.x = 0.0
+        self.x_dot = 0.0
+        # Randomize initial angle within a defined range
+        self.theta = np.random.uniform(low=-np.pi/2, high=np.pi/2)  # Adjust range as needed
+        self.theta_dot = 0.0
+        self.t = 0.0
+        return np.array([self.x, self.x_dot, self.theta, self.theta_dot])
+
+from torch import nn
+class PolicyNetwork(nn.Module):
+    def __init__(self, obs_space_size, action_space_size):
+        super().__init__()
+
+        self.shared_layers = nn.Sequential(
+            nn.Linear(obs_space_size, 64),
+            nn.ReLU(),
+            nn.Linear(64, 64),
+            nn.ReLU()
+        )
+
+        self.policy_mean = nn.Sequential(
+            nn.Linear(64, 64),
+            nn.ReLU(),
+            nn.Linear(64, action_space_size)
+        )
+
+        self.policy_logstd = nn.Parameter(torch.zeros(1, action_space_size))
+
+    def forward(self, obs):
+        z = self.shared_layers(obs)
+        mean = self.policy_mean(z)
+        std = torch.exp(self.policy_logstd).to(device)
+        return mean, std
+
+class ValueNetwork(nn.Module):
+    def __init__(self, obs_space_size):
+        super().__init__()
+
+        self.shared_layers = nn.Sequential(
+            nn.Linear(obs_space_size, 64),
+            nn.ReLU(),
+            nn.Linear(64, 64),
+            nn.ReLU()
+        )
+
+        self.value_layers = nn.Sequential(
+            nn.Linear(64, 64),
+            nn.ReLU(),
+            nn.Linear(64, 1)
+        )
+
+    def forward(self, obs):
+        z = self.shared_layers(obs)
+        value = self.value_layers(z)
+        return value
+def generate_episode(model, env, max_steps=1000):
+    obs = env.reset()
+    states = []
+    actions = []
+    rewards = []
+    log_probs = []
+
+    for _ in range(max_steps):
+        mean, std = model(torch.tensor([obs], dtype=torch.float32, device=device))
+
+        act_distribution = MultivariateNormal(mean, torch.diag_embed(std).to(device))
+        act = act_distribution.sample()
+        act_log_prob = act_distribution.log_prob(act).item()
+
+        act = act.item()
+
+        next_obs, reward, done, *_ = env.step(act)
+        next_obs = next_obs.ravel()
+
+        obs = next_obs
+        states.append(obs)
+        actions.append(act)
+        rewards.append(reward)
+        log_probs.append(act_log_prob)
+        if done:
+            break
+
+    return states, actions, rewards, log_probs
+env = CartPoleOptimalControlEnv()
+policy_model = PolicyNetwork(env.state_space.shape[0], env.action_space.shape[0])
+policy_model = policy_model.to(device)
+
+value_model = ValueNetwork(env.state_space.shape[0])
+value_model = value_model.to(device)
+
+# Define training params
+n_episodes = 100
+print_freq = 1
+
+ppo = PPOTrainer(
+    policy_model,value_model,
+    policy_lr = 3e-4,
+    value_lr = 1e-3,
+    target_kl_div = 0.02,
+    max_policy_train_iters = 100,
+    value_train_iters = 100)
+# Training loop
+ep_rewards = []
+for episode_idx in range(n_episodes):
+  obs, actions, rewards, log_probs=generate_episode(policy_model,env)
+  ep_rewards.append(np.sum(rewards))
+  T=len(rewards)
+  gamma=0.99
+  Gs = []
+  G = 0
+  for t in range(T-1,-1,-1): # iterate in backward order to make the computation easier
+        G = rewards[t] + gamma*G
+        Gs.insert(0,G)
+  gaes = torch.tensor(Gs,dtype=torch.float32, device=device).view(-1,1)
+
+
+  # Policy data
+  obs = torch.tensor(obs,
+                     dtype=torch.float32, device=device)
+  acts = torch.tensor(actions,
+                      dtype=torch.int32, device=device)
+  act_log_probs = torch.tensor(log_probs,
+                               dtype=torch.float32, device=device)
+
+  # # Value data
+  # returns = discount_rewards(train_data[2])[permute_idxs]
+  # returns = torch.tensor(returns, dtype=torch.float32, device=device)
+
+  # Train model
+  ppo.train_policy(obs, acts, act_log_probs, gaes)
+  ppo.train_value(obs, gaes)
+
+  if (episode_idx + 1) % print_freq == 0:
+    print('Episode {} | Avg Reward {:.1f}'.format(
+        episode_idx + 1, np.mean(ep_rewards[-print_freq:])))
+
+import torch
+import numpy as np
+import matplotlib.pyplot as plt
+
+def evaluate_ppo(env, policy_model,angle):
+  rewards = []
+  control_inputs = []
+  states = []
+  for _ in range(1):
+    state = env.reset()
+    state[2]=angle
+    episode_rewards = []
+    episode_control_inputs = []
+    episode_states = []
+    done = False
+    while not done:
+      mean,std=policy_model(torch.FloatTensor(state))
+      # action = agent.act(state)
+      act_distribution = MultivariateNormal(mean, torch.diag_embed(std).to(device))
+      action = act_distribution.sample().item()
+      # print(action)
+      next_state, reward, done, info = env.step(action)
+      episode_rewards.append(reward)
+      episode_control_inputs.append(action)
+      episode_states.append(state)
+      state = next_state
+    rewards.append(sum(episode_rewards))
+    control_inputs.append(np.array(episode_control_inputs))
+    states.append(np.array(episode_states))
+  return rewards, control_inputs, states
+
+
+rewards, control_inputs, states = evaluate_ppo(env, policy_model,1.0472)
+
+
+rewards, control_inputs, states = evaluate_ppo(env, policy_model,1.0472)
+# Assuming 'episode_idx' is the index of the chosen episode
+episode_ctrl_inputs = control_inputs[0]
+episode_states = states[0]
+plt.figure(figsize=(12, 6))
+
+# Control input plot
+plt.subplot(211)
+# for dim in range(len(episode_ctrl_inputs)):  # Assuming multiple dimensions
+plt.plot(episode_ctrl_inputs, label=f'Control Input {1}')
+plt.xlabel('Timestep')
+plt.ylabel('Control Input Value')
+plt.legend()
+
+# State plot (assuming multiple dimensions)
+plt.subplot(212)
+# for dim in range(len(episode_states[0])):
+plt.plot(episode_states[:,2], label=f'State {1}')
+plt.xlabel('Timestep')
+plt.ylabel('State Value')
+plt.legend()
+
+plt.tight_layout()
+plt.show()
+rewards, control_inputs, states = evaluate_ppo(env, policy_model,0.5236)
+# Assuming 'episode_idx' is the index of the chosen episode
+episode_ctrl_inputs = control_inputs[0]
+episode_states = states[0]
+plt.figure(figsize=(12, 6))
+
+# Control input plot
+plt.subplot(211)
+# for dim in range(len(episode_ctrl_inputs)):  # Assuming multiple dimensions
+plt.plot(episode_ctrl_inputs, label=f'Control Input {1}')
+plt.xlabel('Timestep')
+plt.ylabel('Control Input Value')
+plt.legend()
+
+# State plot (assuming multiple dimensions)
+plt.subplot(212)
+# for dim in range(len(episode_states[0])):
+plt.plot(episode_states[:,2], label=f'State {1}')
+plt.xlabel('Timestep')
+plt.ylabel('State Value')
+plt.legend()
+
+plt.tight_layout()
+plt.show()
+
+rewards, control_inputs, states = evaluate_ppo(env, policy_model,1.5708)
+# Assuming 'episode_idx' is the index of the chosen episode
+episode_ctrl_inputs = control_inputs[0]
+episode_states = states[0]
+plt.figure(figsize=(12, 6))
+# print(states[0])
+# print(episode_states[:,0])
+# Control input plot
+plt.subplot(211)
+# for dim in range(len(episode_ctrl_inputs)):  # Assuming multiple dimensions
+plt.plot(episode_ctrl_inputs, label=f'Control Input {1}')
+plt.xlabel('Timestep')
+plt.ylabel('Control Input Value')
+plt.legend()
+
+# State plot (assuming multiple dimensions)
+plt.subplot(212)
+# for dim in range(len(episode_states[0])):
+plt.plot(episode_states[:,2], label=f'State {1}')
+plt.xlabel('Timestep')
+plt.ylabel('State Value')
+plt.legend()
+
+plt.tight_layout()
+plt.show()
